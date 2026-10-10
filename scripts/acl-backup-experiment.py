@@ -35,7 +35,7 @@ class Entry(C.Structure):
 
 
 class Privileges(C.Structure):
-    _fields_ = [("count", W.DWORD), ("entries", Entry * 2)]
+    _fields_ = [("count", W.DWORD), ("entries", Entry * 3)]
 
 
 class Api:
@@ -70,14 +70,34 @@ class Api:
         previous, desired, needed = Privileges(), Privileges(), W.DWORD()
         changed = False
         try:
-            desired.count = 2
-            for i, name in enumerate(("SeSecurityPrivilege","SeRestorePrivilege")):
+            desired.count = 3
+            for i, name in enumerate(("SeSecurityPrivilege","SeRestorePrivilege","SeBackupPrivilege")):
                 self.check(lookup(None,name,C.byref(desired.entries[i].luid)))
                 desired.entries[i].attributes = 2
             C.set_last_error(0)
             self.check(adjust(token,False,C.byref(desired),C.sizeof(previous),C.byref(previous),C.byref(needed)))
             changed = True
-            yield C.get_last_error() != 1300
+            adjust_error = C.get_last_error()
+            restricted = fn(self.a,"IsTokenRestricted",[W.HANDLE],W.BOOL)
+            info = fn(self.a,"GetTokenInformation",[W.HANDLE,C.c_int,C.c_void_p,W.DWORD,C.POINTER(W.DWORD)],W.BOOL)
+            size = W.DWORD()
+            info(token,3,None,0,C.byref(size))
+            buffer = C.create_string_buffer(size.value)
+            self.check(info(token,3,buffer,size.value,C.byref(size)))
+            enabled = []
+            count = W.DWORD.from_buffer(buffer).value
+            for i,name in enumerate(("SeSecurityPrivilege","SeRestorePrivilege","SeBackupPrivilege")):
+                luid = desired.entries[i].luid
+                attributes = None
+                for j in range(count):
+                    entry = Entry.from_buffer(buffer,4+j*C.sizeof(Entry))
+                    if entry.luid.low==luid.low and entry.luid.high==luid.high:
+                        attributes=entry.attributes;break
+                enabled.append({"name":name,"attributes":attributes,"enabled":attributes is not None and bool(attributes&2)})
+            elevated=W.DWORD()
+            self.check(info(token,20,C.byref(elevated),C.sizeof(elevated),C.byref(size)))
+            self.privilege_report={"adjust_error":adjust_error,"restricted":bool(restricted(token)),"elevated":bool(elevated.value),"privileges":enabled}
+            yield adjust_error != 1300
         finally:
             if changed:
                 self.check(adjust(token,False,C.byref(previous),0,None,None))
@@ -91,9 +111,9 @@ class Api:
             raise C.WinError(C.get_last_error())
         return h
 
-    def snapshot(self,h):
+    def snapshot(self,h,query=0x10000):
         sd=C.c_void_p()
-        status=self.get(h,1,0x10000,None,None,None,None,C.byref(sd))
+        status=self.get(h,1,query,None,None,None,None,C.byref(sd))
         if status:
             raise C.WinError(status)
         try:
@@ -143,37 +163,55 @@ def main():
     results=[]
     with api.privileges() as available:
         if not available:
-            print(json.dumps({"available":False,"reason":"SeSecurityPrivilege/SeRestorePrivilege unavailable; no UAC requested","docs":DOCS}));return
+            print(json.dumps({"available":False,"reason":"Required backup/security/restore privileges unavailable; no UAC requested","privileges":api.privilege_report,"docs":DOCS}));return
         directory=C.create_unicode_buffer(32768)
         size=api.get_system(directory,len(directory));api.check(size and size<len(directory))
         editor=str(Path(directory.value)/"icacls.exe")
-        for mode in ("nt-backup","nt-all","backupwrite"):
-            for changed in (False,True):
-                result={"mode":mode,"changed":changed}
-                with tempfile.TemporaryDirectory(prefix="gitgo_acl_backup_") as temp:
-                    root=Path(temp).resolve()/"workspace"
-                    root.mkdir();(root/"nested").mkdir();(root/"nested"/"file").write_text("owned diagnostic")
-                    paths=[root,root/"nested",root/"nested"/"file"]
-                    handles=[]
-                    try:
-                        handles=[api.handle(p) for p in paths]
-                        before=[api.snapshot(h) for h in handles]
-                        if changed:
-                            subprocess.run([editor,str(root),"/grant","*S-1-1-0:(OI)(CI)R"],check=True,capture_output=True)
-                            subprocess.run([editor,str(root),"/setintegritylevel","(OI)(CI)L"],check=True,capture_output=True)
-                        for h,record in zip(handles,before):
-                            api.restore(h,record["raw"],mode)
-                        after=[api.snapshot(h) for h in handles]
-                        result["matched"]=all(a["control"]==b["control"] and a["sddl"]==b["sddl"] for a,b in zip(before,after))
-                        result["binary_matched"]=all(a["raw"]==b["raw"] for a,b in zip(before,after))
-                        result["records"]=[{"before":summary(a),"after":summary(b)} for a,b in zip(before,after)]
-                        if (root/"nested"/"file").read_text()!="owned diagnostic":raise AssertionError("File content changed")
-                    except BaseException as e:
-                        result["error_type"]=type(e).__name__;result["winerror"]=getattr(e,"winerror",None)
-                    finally:
-                        for h in reversed(handles):api.close(h)
-                results.append(result)
-    print(json.dumps({"available":True,"results":results,"docs":DOCS},indent=2))
+        for query in (0x10000,0xf):
+            for mode in ("nt-backup","nt-all","backupwrite"):
+                for changed in (False,True):
+                    result={"mode":mode,"query":hex(query),"changed":changed,"phase":"create"}
+                    with tempfile.TemporaryDirectory(prefix="gitgo_acl_backup_") as temp:
+                        root=Path(temp).resolve()/"workspace"
+                        root.mkdir();(root/"nested").mkdir();(root/"nested"/"file").write_text("owned diagnostic")
+                        paths=[root,root/"nested",root/"nested"/"file"]
+                        handles=[]
+                        try:
+                            result["phase"]="open"
+                            for index,path in enumerate(paths):
+                                result["object_index"]=index
+                                handles.append(api.handle(path))
+                            result["phase"]="snapshot"
+                            before=[]
+                            for index,h in enumerate(handles):
+                                result["object_index"]=index
+                                before.append(api.snapshot(h,query))
+                            result["before"]=[summary(r) for r in before]
+                            if changed:
+                                result["phase"]="grant"
+                                subprocess.run([editor,str(root),"/grant","*S-1-1-0:(OI)(CI)R"],check=True,capture_output=True)
+                                result["phase"]="label"
+                                subprocess.run([editor,str(root),"/setintegritylevel","(OI)(CI)L"],check=True,capture_output=True)
+                            result["phase"]="restore"
+                            for index,(h,record) in enumerate(zip(handles,before)):
+                                result["object_index"]=index
+                                api.restore(h,record["raw"],mode)
+                            result["phase"]="verify"
+                            after=[]
+                            for index,h in enumerate(handles):
+                                result["object_index"]=index
+                                after.append(api.snapshot(h,query))
+                            result["matched"]=all(a["control"]==b["control"] and a["sddl"]==b["sddl"] for a,b in zip(before,after))
+                            result["binary_matched"]=all(a["raw"]==b["raw"] for a,b in zip(before,after))
+                            result["records"]=[{"before":summary(a),"after":summary(b)} for a,b in zip(before,after)]
+                            if (root/"nested"/"file").read_text()!="owned diagnostic":raise AssertionError("File content changed")
+                            result["phase"]="complete"
+                        except BaseException as e:
+                            result["error_type"]=type(e).__name__;result["winerror"]=getattr(e,"winerror",None)
+                        finally:
+                            for h in reversed(handles):api.close(h)
+                    results.append(result)
+    print(json.dumps({"available":True,"privileges":api.privilege_report,"results":results,"docs":DOCS},indent=2))
 
 
 if __name__=="__main__":main()
