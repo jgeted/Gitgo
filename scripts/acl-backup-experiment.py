@@ -214,4 +214,157 @@ def main():
     print(json.dumps({"available":True,"privileges":api.privilege_report,"results":results,"docs":DOCS},indent=2))
 
 
-if __name__=="__main__":main()
+
+
+
+def acl_aces(raw,offset):
+    position=int.from_bytes(raw[offset:offset+4],"little")
+    if not position:return None
+    count=int.from_bytes(raw[position+4:position+6],"little")
+    index=position+8
+    entries=[]
+    for _ in range(count):
+        size=int.from_bytes(raw[index+2:index+4],"little")
+        entries.append(raw[index:index+size].hex());index+=size
+    return entries
+
+
+def semantic(record):
+    control=record["control"]
+    sacl=acl_aces(record["raw"],12)
+    sddl=record["sddl"]
+    if not sacl:
+        # Only no-audit/no-label representation: preserve AI, AR and P bits.
+        control &= ~0x10
+        if "S:" in sddl:sddl=sddl.split("S:",1)[0]
+    return {"control":control,"sddl":sddl,"dacl_aces":acl_aces(record["raw"],16),"sacl_aces":sacl or []}
+
+
+def tree_records(api,root):
+    paths=[root,*sorted(root.rglob("*"))]
+    result=[]
+    for path in paths:
+        h=api.handle(path)
+        try: result.append((str(path.relative_to(root)),api.snapshot(h,0xf)))
+        finally: api.close(h)
+    return result
+
+
+def compare_trees(api,left,right):
+    before,after=tree_records(api,left),tree_records(api,right)
+    differences=[]
+    for (pa,a),(pb,b) in zip(before,after):
+        if pa!=pb or semantic(a)!=semantic(b):
+            differences.append({"relative_path":pa,"before":summary(a),"after":summary(b)})
+    return {"matched":len(before)==len(after) and not differences,"object_count":len(before),"differences":differences,
+            "representation_only":[{"relative_path":pa,"before_control":a["control"],"after_control":b["control"]}
+                 for (pa,a),(_,b) in zip(before,after) if a["control"]!=b["control"] and semantic(a)==semantic(b)]}
+
+
+def initialise_sacl(api,root,scenario):
+    if scenario=="legacy":return
+    convert=fn(api.a,"ConvertStringSecurityDescriptorToSecurityDescriptorW",[W.LPCWSTR,W.DWORD,C.POINTER(C.c_void_p),C.c_void_p],W.BOOL)
+    for path in [root,*sorted(root.rglob("*"))]:
+        flags="OICI" if path.is_dir() else ""
+        label=f"(ML;{flags};NW;;;ME)"
+        audit=f"(AU;{flags}SAFA;FR;;;WD)" if scenario in {"audit","protected-sacl"} else ""
+        text="S:"+("P" if scenario=="protected-sacl" else "")+audit+label
+        sd=C.c_void_p();api.check(convert(text,1,C.byref(sd),None))
+        h=api.handle(path)
+        try:
+            status=api.set(h,8,sd)
+            if status:raise C.WinError(api.error(status))
+        finally:api.close(h);api.free(sd)
+
+
+def ordinary_backup(api):
+    result={"mode":"ordinary-token-backupwrite","phase":"create"}
+    with tempfile.TemporaryDirectory(prefix="gitgo_acl_ordinary_") as temp:
+        root=Path(temp).resolve()/"workspace";root.mkdir()
+        h=None
+        try:
+            result["phase"]="open"
+            h=api.open(str(root),0xe0001,3,None,3,0x02200000,None)
+            if h==C.c_void_p(-1).value:raise C.WinError(C.get_last_error())
+            result["phase"]="snapshot"
+            before=api.snapshot(h,1|2|4|16)
+            result["phase"]="restore"
+            api.restore(h,before["raw"],"backupwrite")
+            result["phase"]="verify"
+            after=api.snapshot(h,1|2|4|16)
+            result["semantic_matched"]=semantic(before)==semantic(after)
+            result["before"]=summary(before);result["after"]=summary(after)
+            result["phase"]="complete"
+        except BaseException as e:
+            result["error_type"]=type(e).__name__;result["winerror"]=getattr(e,"winerror",None)
+        finally:
+            if h and h!=C.c_void_p(-1).value:api.close(h)
+    return result
+
+
+def differential_main():
+    if os.name!="nt":print(json.dumps({"available":False,"reason":"Windows only"}));return
+    api=Api();results=[]
+    ordinary=ordinary_backup(api)
+    with api.privileges() as available:
+        if not available:
+            print(json.dumps({"available":False,"ordinary":ordinary,"privileges":api.privilege_report,"docs":DOCS}));return
+        directory=C.create_unicode_buffer(32768)
+        size=api.get_system(directory,len(directory));api.check(size and size<len(directory))
+        editor=str(Path(directory.value)/"icacls.exe")
+        def edit(path,*args):subprocess.run([editor,str(path),*args],check=True,capture_output=True)
+        for scenario in ("legacy","medium","audit","protected-sacl"):
+            result={"scenario":scenario,"phase":"create","checks":[]}
+            with tempfile.TemporaryDirectory(prefix="gitgo_acl_future_") as temp:
+                parent=Path(temp).resolve()
+                roots=[]
+                for name in ("baseline","restored"):
+                    outer=parent/name;outer.mkdir();root=outer/"workspace";root.mkdir()
+                    (root/"nested").mkdir();(root/"nested"/"file").write_text("owned diagnostic")
+                    roots.append(root)
+                left,right=roots
+                handles=[]
+                try:
+                    result["phase"]="initialise"
+                    for root in roots:initialise_sacl(api,root,scenario)
+                    result["checks"].append({"stage":"initial",**compare_trees(api,left,right)})
+                    result["phase"]="snapshot"
+                    paths=[right,*sorted(right.rglob("*"))]
+                    for path in paths:handles.append(api.handle(path))
+                    originals=[api.snapshot(h,0xf) for h in handles]
+                    result["phase"]="mutate"
+                    edit(right,"/grant","*S-1-1-0:(OI)(CI)R")
+                    edit(right,"/setintegritylevel","(OI)(CI)L")
+                    result["phase"]="restore"
+                    for h,record in zip(handles,originals):api.restore(h,record["raw"],"backupwrite")
+                    for h in reversed(handles):api.close(h)
+                    handles=[]
+                    result["checks"].append({"stage":"restored",**compare_trees(api,left,right)})
+                    result["phase"]="future-parent-add"
+                    for root in roots:edit(root.parent,"/grant","*S-1-5-7:(OI)(CI)R")
+                    result["checks"].append({"stage":"parent-add",**compare_trees(api,left,right)})
+                    result["phase"]="future-parent-label"
+                    for root in roots:edit(root.parent,"/setintegritylevel","(OI)(CI)M")
+                    result["checks"].append({"stage":"parent-medium",**compare_trees(api,left,right)})
+                    result["phase"]="future-new-children"
+                    for root in roots:
+                        (root/"new-directory").mkdir();(root/"new-directory"/"new-file").write_text("future object")
+                        (root/"nested"/"new-file").write_text("future nested object")
+                    result["checks"].append({"stage":"new-children",**compare_trees(api,left,right)})
+                    result["phase"]="future-parent-remove"
+                    for root in roots:edit(root.parent,"/remove:g","*S-1-5-7")
+                    result["checks"].append({"stage":"parent-remove",**compare_trees(api,left,right)})
+                    result["phase"]="future-parent-low"
+                    for root in roots:edit(root.parent,"/setintegritylevel","(OI)(CI)L")
+                    result["checks"].append({"stage":"parent-low",**compare_trees(api,left,right)})
+                    result["phase"]="complete"
+                    result["matched"]=all(c["matched"] for c in result["checks"])
+                except BaseException as e:
+                    result["error_type"]=type(e).__name__;result["winerror"]=getattr(e,"winerror",None)
+                finally:
+                    for h in reversed(handles):api.close(h)
+            results.append(result)
+    print(json.dumps({"available":True,"ordinary":ordinary,"privileges":api.privilege_report,"results":results,"docs":DOCS},indent=2))
+
+
+if __name__=="__main__":differential_main()
