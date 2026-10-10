@@ -5,7 +5,10 @@ from ctypes import wintypes as W
 import json, re, hashlib, sys, tempfile, time
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
-from backend.core.windows_acl import SecurityTree, _fn
+import importlib.util
+spec=importlib.util.spec_from_file_location('acl',Path(__file__).resolve().parents[1]/'backend/core/windows_acl.py')
+acl=importlib.util.module_from_spec(spec);spec.loader.exec_module(acl)
+SecurityTree,_fn=acl.SecurityTree,acl._fn
 
 def safe(s):
  return re.sub(r'S-1-[0-9-]+',lambda m:'principal-'+hashlib.sha256(m[0].encode()).hexdigest()[:12],s)

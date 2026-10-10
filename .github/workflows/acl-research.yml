@@ -17,3 +17,5 @@ jobs:
           python-version: "3.14"
       - name: Exact descriptor experiments in owned temporary trees
         run: python -B scripts/acl-native-experiment.py
+      - name: Backup descriptor experiments in owned temporary trees
+        run: python -B scripts/acl-backup-experiment.py
