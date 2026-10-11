@@ -7,7 +7,7 @@ permissions:
 jobs:
   windows:
     runs-on: windows-latest
-    timeout-minutes: 6
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v4
         with:
@@ -15,9 +15,5 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.14"
-      - name: Exact descriptor experiments in owned temporary trees
-        run: python -B scripts/acl-native-experiment.py
-      - name: Backup descriptor experiments in owned temporary trees
-        run: python -B scripts/acl-backup-experiment.py
-      - name: Exact inheritance matrix in owned temporary trees
-        run: python -B scripts/acl-exact-matrix.py
+      - name: Independently verify native snapshot source
+        run: python -B scripts/acl-query-proof.py
