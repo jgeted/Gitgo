@@ -189,6 +189,8 @@ def main():
         if not available:
             print(json.dumps({'available': False, 'reason': 'Required operator rights absent; no UAC requested',
                               'privileges': api.privilege_report}))
+            if os.environ.get('GITHUB_ACTIONS', '').lower() == 'true':
+                raise SystemExit(2)
             return
         directory = C.create_unicode_buffer(32768)
         size = api.get_system(directory, len(directory))

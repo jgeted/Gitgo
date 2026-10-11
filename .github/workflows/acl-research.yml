@@ -17,3 +17,7 @@ jobs:
           python-version: "3.14"
       - name: Independently verify native snapshot source
         run: python -B scripts/acl-query-proof.py
+      - run: python -m pip install -r requirements-portable.txt
+      - run: python -B scripts/provision_ci_sqlite.py
+      - name: Native ACL transaction and future inheritance acceptance
+        run: python -B -m pytest tests/test_windows_security_descriptor.py tests/test_windows_security_privileges.py tests/test_windows_acl_plan.py tests/test_windows_acl_provisioning.py tests/test_windows_acl_inheritance.py tests/test_windows_acl_sacl_inheritance.py tests/test_windows_acl_management.py -q
