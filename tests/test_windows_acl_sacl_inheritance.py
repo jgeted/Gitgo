@@ -4,9 +4,11 @@ from __future__ import annotations
 import base64
 import ctypes as C
 from ctypes import wintypes as W
+from dataclasses import replace
 import os
 from pathlib import Path
 import subprocess
+import struct
 import sys
 
 import pytest
@@ -18,10 +20,11 @@ from backend.core.windows_security_privileges import security_privileges
 
 pytestmark = pytest.mark.skipif(sys.platform != 'win32', reason='Native Windows SACL inheritance')
 
-# Structurally valid synthetic identities only: these tests never create an
-# account, profile, AppContainer token, or ACE on a pre-existing user directory.
+# The provisioning SID is structurally valid and synthetic. Future read/audit
+# entries use the well-known Anonymous SID because icacls resolves account SIDs.
+# No account, profile, token, or permission on pre-existing user files is created.
 _PROVISION_SID = 'S-1-15-2-111111111-222222222-333333333-444444444-555555555-666666666-777777777'
-_FUTURE_SID = 'S-1-5-21-111111111-222222222-333333333-42001'
+_FUTURE_SID = 'S-1-5-7'
 
 
 @pytest.fixture(autouse=True)
@@ -96,6 +99,25 @@ def _make_member(outer: Path, scenario: str):
     (root / 'nested' / 'file.txt').write_text('owned SACL fixture', encoding='utf-8')
     if scenario == 'legacy':
         return root
+    if scenario in {'empty-sacl', 'protected-empty-sacl'}:
+        with SecurityTree([root]) as tree, security_privileges():
+            for record in tree.snapshot():
+                original = SecurityDescriptor.from_bytes(base64.b64decode(record['descriptor'], validate=True))
+                # Retain the original control bits; only choose protection for
+                # this fixture and mark the real eight-byte empty ACL present.
+                control = (original.control | 0x10) & ~0x2000
+                if scenario == 'protected-empty-sacl':
+                    control |= 0x2000
+                empty = replace(original, control=control, sacl=struct.pack('<BBHHH', 2, 0, 8, 0, 0))
+                descriptor = C.create_string_buffer(empty.to_bytes())
+                status = tree.set_object_security(tree.handles[record['path']], 8 | 16, descriptor)
+                if status:
+                    raise C.WinError(tree.status_to_error(status))
+            for record in tree.snapshot():
+                value = SecurityDescriptor.from_bytes(base64.b64decode(record['descriptor'], validate=True))
+                assert value.sacl is not None and int.from_bytes(value.sacl[4:6], 'little') == 0
+                assert bool(value.control & 0x2000) == (scenario == 'protected-empty-sacl')
+        return root
     # The original regression used explicit unprotected Medium/audit SACLs on
     # every level. Install that precise fixture using a separate native setter.
     with SecurityTree([root]) as tree, security_privileges():
@@ -121,6 +143,55 @@ def _make_member(outer: Path, scenario: str):
     return root
 
 
+def _aces(acl: bytes | None):
+    if acl is None:
+        return []
+    cursor = 8
+    result = []
+    for _ in range(int.from_bytes(acl[4:6], 'little')):
+        size = int.from_bytes(acl[cursor + 2:cursor + 4], 'little')
+        assert size >= 4 and cursor + size <= len(acl)
+        result.append(acl[cursor:cursor + size])
+        cursor += size
+    return result
+
+
+def _parent_audit(outer: Path, *, add: bool):
+    # Use the propagating Win32 setter on a complete, current SACL. Preserve
+    # unrelated audit entries and the current mandatory label byte-for-byte.
+    with SecurityTree([outer]) as tree, security_privileges():
+        handle = tree.handles[str(outer)]
+        original = SecurityDescriptor.from_bytes(tree._security_bytes(handle))
+        descriptor = C.c_void_p()
+        tree.check(tree.from_sddl(f'S:(AU;OICISAFA;FR;;;{_FUTURE_SID})', 1,
+                                  C.byref(descriptor), None))
+        try:
+            audit_descriptor = SecurityDescriptor.from_bytes(C.string_at(
+                descriptor, tree.descriptor_length(descriptor)))
+            audit_ace, = _aces(audit_descriptor.sacl)
+        finally:
+            tree.free(descriptor)
+        old = _aces(original.sacl)
+        if add:
+            assert audit_ace not in old
+            # Audit ACEs precede mandatory-label ACEs; preserve old order.
+            entries = [audit_ace, *old]
+        else:
+            assert old.count(audit_ace) == 1
+            entries = [entry for entry in old if entry != audit_ace]
+        revision = original.sacl[0] if original.sacl is not None else 2
+        raw_acl = struct.pack('<BBHHH', revision, 0,
+                              8 + sum(map(len, entries)), len(entries), 0) + b''.join(entries)
+        acl = C.create_string_buffer(raw_acl)
+        status = tree.set_security(handle, 1, 8, None, None, None, acl)
+        if status:
+            raise C.WinError(status)
+        current = SecurityDescriptor.from_bytes(tree._security_bytes(handle))
+        assert [ace for ace in _aces(current.sacl) if ace[0] == 0x11] == [
+            ace for ace in old if ace[0] == 0x11], 'Audit update changed the current MIC'
+        assert (audit_ace in _aces(current.sacl)) == add
+
+
 def _add_children(root: Path, name: str):
     for parent in (root, root / 'nested'):
         directory = parent / ('new_' + name)
@@ -129,7 +200,8 @@ def _add_children(root: Path, name: str):
         (parent / ('new_' + name + '.txt')).write_text('future SACL fixture', encoding='utf-8')
 
 
-@pytest.mark.parametrize('scenario', ['legacy', 'medium', 'audit', 'protected-sacl'])
+@pytest.mark.parametrize('scenario', [
+    'legacy', 'empty-sacl', 'protected-empty-sacl', 'medium', 'audit', 'protected-sacl'])
 def test_production_restore_preserves_future_sacl_inheritance(tmp_path_factory: Path, scenario: str):
     baseline_outer, candidate_outer = tmp_path_factory / 'baseline', tmp_path_factory / 'candidate'
     baseline = _make_member(baseline_outer, scenario)
@@ -155,6 +227,17 @@ def test_production_restore_preserves_future_sacl_inheritance(tmp_path_factory: 
         _add_children(root, 'restored')
     _assert_same(baseline_outer, candidate_outer, 'new children after restore')
 
+    # Audit inheritance is exercised while ancestors still have zero audit/
+    # label entries, before parent MIC updates can hide representation changes.
+    for add in (True, False):
+        stage = 'audit_add_before_mic' if add else 'audit_remove_before_mic'
+        for outer in (baseline_outer, candidate_outer):
+            _parent_audit(outer, add=add)
+        _assert_same(baseline_outer, candidate_outer, stage)
+        for root in (baseline, candidate):
+            _add_children(root, stage)
+        _assert_same(baseline_outer, candidate_outer, 'new children after ' + stage)
+
     # Each action changes an ancestor outside the restored tree. Every stage
     # checks full stored owner/group/DACL/SACL/control, including future nodes.
     for stage, arguments in (
@@ -165,6 +248,17 @@ def test_production_restore_preserves_future_sacl_inheritance(tmp_path_factory: 
     ):
         for outer in (baseline_outer, candidate_outer):
             _edit(outer, *arguments)
+        _assert_same(baseline_outer, candidate_outer, stage)
+        for root in (baseline, candidate):
+            _add_children(root, stage)
+        _assert_same(baseline_outer, candidate_outer, 'new children after ' + stage)
+
+    # Repeat with an explicit Low MIC already present: SACL audit updates must
+    # preserve that MIC while still propagating additions and removals.
+    for add in (True, False):
+        stage = 'audit_add_after_mic' if add else 'audit_remove_after_mic'
+        for outer in (baseline_outer, candidate_outer):
+            _parent_audit(outer, add=add)
         _assert_same(baseline_outer, candidate_outer, stage)
         for root in (baseline, candidate):
             _add_children(root, stage)

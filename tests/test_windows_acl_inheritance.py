@@ -28,11 +28,11 @@ def operator_privileges():
         pytest.skip(str(error))
 
 
-# Valid synthetic SIDs, never attached to a token or an account/profile. Their
-# ACEs exercise propagation/deny ordering without denying the test operator.
-_ORIGINAL_SID = "S-1-5-21-111111111-222222222-333333333-41001"
-_PROVISION_SID = "S-1-5-21-111111111-222222222-333333333-41002"
-_FUTURE_SID = "S-1-5-21-111111111-222222222-333333333-41003"
+# Well-known principals avoid icacls account-lookup failures for fabricated
+# account SIDs. Anonymous denial does not deny the elevated test operator.
+_ORIGINAL_SID = "S-1-5-7"  # ANONYMOUS LOGON
+_PROVISION_SID = "S-1-1-0"  # Everyone, read-only temporary diagnostic grant
+_FUTURE_SID = "S-1-5-32-546"  # Builtin Guests
 
 
 def _edit_acl(path: Path, *arguments: str) -> None:
@@ -102,7 +102,8 @@ def _make_pair_member(parent: Path, layout: str, flags: str) -> Path:
             for record in tree.snapshot():
                 descriptor = SecurityDescriptor.from_bytes(base64.b64decode(record['descriptor']))
                 assert not descriptor.control & (0x400 | 0x1000)
-                assert ';ID;' not in record['sddl']
+                assert all('ID' not in ace[1:-1].split(';')[1]
+                           for ace in re.findall(r'\([^()]+\)', record['sddl'].split('S:', 1)[0]))
     elif layout == 'protected_child':
         _edit_acl(root / 'nested', '/inheritance:d')
         with SecurityTree([root / 'nested'], writable=False) as tree:
