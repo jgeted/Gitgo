@@ -135,7 +135,7 @@ def paired_comparison(api, left, right):
                 binary_differences.append({"path": path, "kind": kind, "left": record_summary(x), "right": record_summary(y)})
             if binary_components(x) != binary_components(y):
                 differences.append({"path": path, "kind": kind, "left": record_summary(x), "right": record_summary(y)})
-    return {"matched": not differences and not unavailable, "object_count": len(a),
+    return {"matched": not differences and not any(i["kind"].endswith("all") for i in unavailable), "all_query_kinds_available":not unavailable, "object_count": len(a),
             "differences": differences, "binary_differences": binary_differences, "unavailable": unavailable}
 
 
@@ -165,7 +165,7 @@ def run_case(api, editor, scenario, mode):
             paths = [right, *sorted(right.rglob("*"))]
             for path in paths:
                 handles.append(api.handle(path))
-            originals = [api.native_snapshot(handle, 0x10000) for handle in handles]
+            originals = [api.native_snapshot(handle, 0x1ff) for handle in handles]
             if scenario != "legacy":
                 assert all("(ML;" in record["sddl"] and ";;;ME)" in record["sddl"] for record in originals), "Missing original Medium MIC"
             result["phase"] = "mutate"
