@@ -153,7 +153,11 @@ def safe(sddl):
 
 
 def summary(record):
-    return {"control":record["control"],"sddl":safe(record["sddl"]),"binary_sha256":hashlib.sha256(record["raw"]).hexdigest()}
+    raw=record['raw']
+    def acl_header(offset):
+        p=int.from_bytes(raw[offset:offset+4], 'little')
+        return None if not p else raw[p:p+8].hex()
+    return {"raw_header":raw[:20].hex(),"dacl_header":acl_header(16),"sacl_header":acl_header(12),"control":record["control"],"sddl":safe(record["sddl"]),"binary_sha256":hashlib.sha256(record["raw"]).hexdigest()}
 
 
 def main():
@@ -257,7 +261,8 @@ def compare_trees(api,left,right):
         if pa!=pb or semantic(a)!=semantic(b):
             differences.append({"relative_path":pa,"before":summary(a),"after":summary(b)})
     return {"matched":len(before)==len(after) and not differences,"object_count":len(before),"differences":differences,
-            "representation_only":[{"relative_path":pa,"before_control":a["control"],"after_control":b["control"]}
+            "binary_differences":[{"relative_path":pa,"before":summary(a),"after":summary(b)} for (pa,a),(_,b) in zip(before,after) if a["raw"]!=b["raw"]],
+            "representation_only":[ {"relative_path":pa,"before_control":a["control"],"after_control":b["control"]}
                  for (pa,a),(_,b) in zip(before,after) if a["control"]!=b["control"] and semantic(a)==semantic(b)]}
 
 
