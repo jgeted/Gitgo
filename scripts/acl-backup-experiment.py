@@ -106,7 +106,7 @@ class Api:
     def handle(self,path):
         # READ_DATA/LIST_DIRECTORY, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
         # ACCESS_SYSTEM_SECURITY. No delete sharing, no async I/O.
-        h=self.open(str(path),0x010e0001,3,None,3,0x02200000,None)
+        h=self.open(str(path),0x010e0089,3,None,3,0x02200000,None)
         if h == C.c_void_p(-1).value:
             raise C.WinError(C.get_last_error())
         return h
@@ -121,7 +121,7 @@ class Api:
             control,rev=W.WORD(),W.DWORD()
             self.check(self.control(sd,C.byref(control),C.byref(rev)))
             txt=W.LPWSTR()
-            self.check(self.text(sd,1,0xf,C.byref(txt),None))
+            self.check(self.text(sd,1,0x1ff,C.byref(txt),None))
             try: sddl=txt.value
             finally: self.free(C.cast(txt,C.c_void_p))
             return {"raw":raw,"control":control.value,"sddl":sddl}
@@ -245,7 +245,7 @@ def tree_records(api,root):
     result=[]
     for path in paths:
         h=api.handle(path)
-        try: result.append((str(path.relative_to(root)),api.snapshot(h,0xf)))
+        try: result.append((str(path.relative_to(root)),api.snapshot(h,0x1ff)))
         finally: api.close(h)
     return result
 
@@ -272,13 +272,13 @@ def initialise_sacl(api,root,scenario):
         sd=C.c_void_p();api.check(convert(text,1,C.byref(sd),None))
         h=api.handle(path)
         try:
-            status=api.set(h,8,sd)
+            status=api.set(h,8|16,sd)
             if status:raise C.WinError(api.error(status))
         finally:api.close(h);api.free(sd)
 
 
-def ordinary_backup(api):
-    result={"mode":"ordinary-token-backupwrite","phase":"create"}
+def ordinary_backup(api,changed=False):
+    result={"mode":"ordinary-token-backupwrite","changed":changed,"phase":"create"}
     with tempfile.TemporaryDirectory(prefix="gitgo_acl_ordinary_") as temp:
         root=Path(temp).resolve()/"workspace";root.mkdir()
         h=None
@@ -288,6 +288,13 @@ def ordinary_backup(api):
             if h==C.c_void_p(-1).value:raise C.WinError(C.get_last_error())
             result["phase"]="snapshot"
             before=api.snapshot(h,1|2|4|16)
+            if changed:
+                directory=C.create_unicode_buffer(32768)
+                size=api.get_system(directory,len(directory));api.check(size and size<len(directory))
+                editor=str(Path(directory.value)/"icacls.exe")
+                result["phase"]="mutate"
+                subprocess.run([editor,str(root),"/grant","*S-1-1-0:(OI)(CI)R"],check=True,capture_output=True)
+                subprocess.run([editor,str(root),"/setintegritylevel","(OI)(CI)L"],check=True,capture_output=True)
             result["phase"]="restore"
             api.restore(h,before["raw"],"backupwrite")
             result["phase"]="verify"
@@ -305,7 +312,7 @@ def ordinary_backup(api):
 def differential_main():
     if os.name!="nt":print(json.dumps({"available":False,"reason":"Windows only"}));return
     api=Api();results=[]
-    ordinary=ordinary_backup(api)
+    ordinary=[ordinary_backup(api,changed) for changed in (False,True)]
     with api.privileges() as available:
         if not available:
             print(json.dumps({"available":False,"ordinary":ordinary,"privileges":api.privilege_report,"docs":DOCS}));return
@@ -331,7 +338,9 @@ def differential_main():
                     result["phase"]="snapshot"
                     paths=[right,*sorted(right.rglob("*"))]
                     for path in paths:handles.append(api.handle(path))
-                    originals=[api.snapshot(h,0xf) for h in handles]
+                    originals=[api.snapshot(h,0x1ff) for h in handles]
+                    if scenario != "legacy":
+                        assert all("(ML;" in r["sddl"] and ";;;ME)" in r["sddl"] for r in originals), "Medium MIC was not captured"
                     result["phase"]="mutate"
                     edit(right,"/grant","*S-1-1-0:(OI)(CI)R")
                     edit(right,"/setintegritylevel","(OI)(CI)L")
