@@ -19,3 +19,5 @@ jobs:
         run: python -B scripts/acl-native-experiment.py
       - name: Backup descriptor experiments in owned temporary trees
         run: python -B scripts/acl-backup-experiment.py
+      - name: Exact inheritance matrix in owned temporary trees
+        run: python -B scripts/acl-exact-matrix.py
