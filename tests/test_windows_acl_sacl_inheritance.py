@@ -115,7 +115,10 @@ def _make_member(outer: Path, scenario: str):
                     raise C.WinError(tree.status_to_error(status))
             for record in tree.snapshot():
                 value = SecurityDescriptor.from_bytes(base64.b64decode(record['descriptor'], validate=True))
-                assert value.sacl is not None and int.from_bytes(value.sacl[4:6], 'little') == 0
+                # NTFS may store a requested empty SACL as a NULL SACL.
+                # Use the actual native snapshot as baseline, retain every
+                # protection/inheritance bit, and test future audit behavior.
+                assert not _aces(value.sacl)
                 assert bool(value.control & 0x2000) == (scenario == 'protected-empty-sacl')
         return root
     # The original regression used explicit unprotected Medium/audit SACLs on
